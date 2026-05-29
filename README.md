@@ -64,6 +64,8 @@ $$\text{rank}_{\text{game}}(G \mid C) = \text{rank}_{\text{local}}(G \mid C) + \
 
 ## Установка
 
+> инструкция для Arch Linux -- единственной операционной системы, которую следует использовать
+
 ```bash
 yay -S python-gensim python-numpy openblas
 ```
