@@ -1,0 +1,5 @@
+model/
+*.pyc
+__pycache__/
+vocab_progress.json
+tayga_nouns_to_check.json
