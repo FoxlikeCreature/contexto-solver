@@ -490,6 +490,27 @@ def run():
                 continue
 
         raw = raw_lower
+
+        # Telegram заголовки и разделители — тихо пропускать
+        if raw_lower.startswith("топ ближайших") or re.match(r'^-{3,}$', raw_lower):
+            continue
+
+        # Telegram emoji-строка: "🔴 слово (10145)" — обрабатывать напрямую
+        tg_m = re.match(r'^[^а-яёa-z\d]*([а-яё]{2,})\s*\((\d+)\)', raw_lower)
+        if tg_m:
+            word, rank = tg_m.group(1), int(tg_m.group(2))
+            if rank == 1:
+                print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
+                solver.reset()
+                cur_word, cur_reason = solver.suggest()
+            elif word not in solver.guesses:
+                if word not in _vocab_set:
+                    print(f"  {DIM}'{word}' нет в словаре{RESET}")
+                else:
+                    solver.add_guess(word, rank)
+                cur_word, cur_reason = solver.suggest()
+            continue
+
         parts = raw.split()
         pairs = _parse_pairs(parts, cur_word)
 
