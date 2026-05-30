@@ -10,6 +10,7 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 import json
+import re
 import numpy as np
 from pathlib import Path
 
@@ -329,6 +330,68 @@ def _parse_pairs(parts: list[str], cur_word: str) -> list[tuple[str, int | None]
     return pairs or None
 
 
+def _looks_like_telegram_start(line: str) -> bool:
+    low = line.lower()
+    return low.startswith("слово:") or low.startswith("близость:")
+
+
+def _parse_telegram_paste(text: str) -> list[tuple[str, int]] | None:
+    """
+    Разбирает вставленное Telegram-сообщение из игры.
+
+    Формат блока:
+        Слово: стакан 🟡
+        Близость: 322
+
+        Топ ближайших слов:
+        🟡 стакан (322)
+        🔴 море (6208)
+        ----------------
+
+    Извлекает все пары (слово, ранг) из Слово/Близость строк
+    и из emoji-строк. При дублях берёт минимальный ранг.
+    """
+    low = text.lower()
+    if "близость:" not in low and "слово:" not in low:
+        return None
+
+    pairs: dict[str, int] = {}
+    pending_word: str | None = None
+
+    for line in text.splitlines():
+        s = line.strip()
+        sl = s.lower()
+
+        # "Слово: стакан 🟡" → pending_word
+        m = re.match(r'слово:\s*([а-яёa-z]+)', sl)
+        if m:
+            pending_word = m.group(1)
+            continue
+
+        # "Близость: 322" → closes the pair
+        m = re.match(r'близость:\s*(\d+)', sl)
+        if m and pending_word:
+            rank = int(m.group(1))
+            if pending_word not in pairs or rank < pairs[pending_word]:
+                pairs[pending_word] = rank
+            pending_word = None
+            continue
+
+        # Сброс pending если пришла нерелевантная строка
+        if pending_word and sl and not sl.startswith("топ") and "--" not in sl:
+            pending_word = None
+
+        # "🟢/🟡/🟠/🔴 ананас (148)"
+        m = re.search(r'[🟢🟡🟠🔴]\s*([а-яё]+)\s*\((\d+)\)', sl)
+        if m:
+            word = m.group(1)
+            rank = int(m.group(2))
+            if word not in pairs or rank < pairs[word]:
+                pairs[word] = rank
+
+    return list(pairs.items()) if pairs else None
+
+
 def run():
     load()
     solver = Solver()
@@ -366,23 +429,60 @@ def run():
         print(f"  {BOLD}{YELLOW}→ {cur_word.upper()}{RESET}  {DIM}({cur_reason}){RESET}{info_str}")
 
         try:
-            raw = input("  ").strip().lower()
+            raw = input("  ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nВыход."); return
 
         if not raw:
             continue
-        if raw in ("q", "quit", "выход"):
+
+        raw_lower = raw.lower()
+        if raw_lower in ("q", "quit", "выход"):
             print("Выход."); return
-        if raw == "?":
+        if raw_lower == "?":
             _print_candidates(solver)
             continue
-        if raw in ("n", "new", "новая"):
+        if raw_lower in ("n", "new", "новая"):
             solver.reset()
             cur_word, cur_reason = solver.suggest()
             print(f"{DIM}Новая игра.{RESET}\n")
             continue
 
+        # Telegram paste: собираем остальные строки до пустой
+        if _looks_like_telegram_start(raw):
+            collected = [raw]
+            try:
+                while True:
+                    nxt = input("").strip()
+                    if not nxt:
+                        break
+                    collected.append(nxt)
+                    if len(collected) > 300:
+                        break
+            except (EOFError, KeyboardInterrupt):
+                pass
+            tg_pairs = _parse_telegram_paste("\n".join(collected))
+            if tg_pairs:
+                print(f"  {DIM}Телеграм: {len(tg_pairs)} слов{RESET}")
+                done = False
+                for word, rank in sorted(tg_pairs, key=lambda x: x[1]):
+                    if rank == 1:
+                        print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
+                        solver.reset()
+                        cur_word, cur_reason = solver.suggest()
+                        done = True
+                        break
+                    if word in solver.guesses:
+                        continue
+                    if word not in _vocab_set:
+                        print(f"  {DIM}'{word}' нет в словаре — пропускаем{RESET}")
+                        continue
+                    solver.add_guess(word, rank)
+                if not done:
+                    cur_word, cur_reason = solver.suggest()
+                continue
+
+        raw = raw_lower
         parts = raw.split()
         pairs = _parse_pairs(parts, cur_word)
 
