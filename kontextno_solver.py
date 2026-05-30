@@ -10,8 +10,9 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 import json
+import os
 import re
-import time
+import select
 import numpy as np
 from pathlib import Path
 
@@ -456,32 +457,27 @@ def run():
             print(f"{DIM}Новая игра.{RESET}\n")
             continue
 
-        # Telegram paste — коллектор со state machine.
-        # Читаем строки пока не увидим пустую строку ПОСЛЕ emoji-контента.
-        # Это позволяет прочитать весь paste за один раз без таймаутов.
+        # Telegram paste.
+        # Первая строка уже получена через input(). Остаток paste лежит
+        # в буфере TTY нетронутым — читаем его через os.read() с нулевым
+        # select (неблокирующая проверка, никаких задержек).
+        # Readline не затрагивается: он не буферизует данные заранее.
         if _looks_like_telegram_start(raw):
-            collected = [raw]
-            after_emoji = False   # видели хотя бы одну 🔴/🟢/🟡/🟠 строку
-            consec_empty = 0
+            extra = b""
             try:
                 while True:
-                    nxt = input("").strip()
-                    if not nxt:
-                        consec_empty += 1
-                        if after_emoji or consec_empty >= 2:
-                            break  # пустая после emoji = конец; двойная пустая = fallback
-                        collected.append("")
-                    else:
-                        consec_empty = 0
-                        if re.search(r'[🟢🟡🟠🔴]', nxt):
-                            after_emoji = True
-                        collected.append(nxt)
-                        if len(collected) > 300:
-                            break
-            except (EOFError, KeyboardInterrupt):
+                    ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0)
+                    if not ready:
+                        break
+                    chunk = os.read(sys.stdin.fileno(), 4096)
+                    if not chunk:
+                        break
+                    extra += chunk
+            except OSError:
                 pass
 
-            tg_pairs = _parse_telegram_paste("\n".join(collected))
+            full_text = raw + "\n" + extra.decode("utf-8", errors="replace")
+            tg_pairs = _parse_telegram_paste(full_text)
             if tg_pairs:
                 for word, rank in sorted(tg_pairs, key=lambda x: x[1]):
                     if rank == 1:
