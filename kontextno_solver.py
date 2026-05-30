@@ -407,10 +407,16 @@ def run():
     print(f"{DIM}  n — новая игра  |  q — выход{RESET}\n")
 
     cur_word, cur_reason = solver.suggest()
-    last_display_t = 0.0  # время последнего показа истории/подсказки
 
-    def _show_state():
-        nonlocal last_display_t
+    while True:
+        # Единственный кандидат — это и есть ответ
+        if solver.candidates and len(solver.candidates) == 1:
+            secret = list(solver.candidates)[0]
+            print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {secret.upper()}{RESET}\n")
+            solver.reset()
+            cur_word, cur_reason = solver.suggest()
+
+        # История угаданных
         if solver.guesses:
             print()
             for w, r in sorted(solver.guesses.items(), key=lambda x: x[1] if x[1] > 0 else 99999):
@@ -418,30 +424,17 @@ def run():
                 col = rank_color(r)
                 print(f"  {col}{r:>5}{RESET}  {w}")
             print()
+
+        # Кандидаты если их мало
         if solver.candidates and len(solver.candidates) <= 5:
             print(f"  {YELLOW}Кандидаты:{RESET}")
             _print_candidates(solver)
             print()
+
+        # Предложение
         info = solver.info()
         info_str = f"  {DIM}[{info}]{RESET}" if info else ""
         print(f"  {BOLD}{YELLOW}→ {cur_word.upper()}{RESET}  {DIM}({cur_reason}){RESET}{info_str}")
-        last_display_t = time.time()
-
-    while True:
-        # Если остался единственный кандидат — это и есть ответ
-        if solver.candidates and len(solver.candidates) == 1:
-            secret = list(solver.candidates)[0]
-            print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {secret.upper()}{RESET}\n")
-            solver.reset()
-            cur_word, cur_reason = solver.suggest()
-            last_display_t = 0.0  # показать новую игру сразу
-            continue
-
-        # Показываем состояние только если прошло > 400мс с последнего показа.
-        # Это устраняет спам при paste: строки из буфера приходят мгновенно (<10мс),
-        # а намеренный Enter от пользователя — через >500мс.
-        if time.time() - last_display_t > 0.4:
-            _show_state()
 
         try:
             raw = input("  ").strip()
@@ -456,57 +449,60 @@ def run():
             print("Выход."); return
         if raw_lower == "?":
             _print_candidates(solver)
-            last_display_t = 0.0
             continue
         if raw_lower in ("n", "new", "новая"):
             solver.reset()
             cur_word, cur_reason = solver.suggest()
             print(f"{DIM}Новая игра.{RESET}\n")
-            last_display_t = 0.0
             continue
 
-        # Telegram paste: собираем "Слово:" + "Близость:" до первой пустой строки.
-        # Остальные строки (Топ, эмодзи) обрабатываются по одной ниже.
+        # Telegram paste — коллектор со state machine.
+        # Читаем строки пока не увидим пустую строку ПОСЛЕ emoji-контента.
+        # Это позволяет прочитать весь paste за один раз без таймаутов.
         if _looks_like_telegram_start(raw):
             collected = [raw]
+            after_emoji = False   # видели хотя бы одну 🔴/🟢/🟡/🟠 строку
+            consec_empty = 0
             try:
                 while True:
                     nxt = input("").strip()
                     if not nxt:
-                        break
-                    collected.append(nxt)
-                    if len(collected) > 300:
-                        break
+                        consec_empty += 1
+                        if after_emoji or consec_empty >= 2:
+                            break  # пустая после emoji = конец; двойная пустая = fallback
+                        collected.append("")
+                    else:
+                        consec_empty = 0
+                        if re.search(r'[🟢🟡🟠🔴]', nxt):
+                            after_emoji = True
+                        collected.append(nxt)
+                        if len(collected) > 300:
+                            break
             except (EOFError, KeyboardInterrupt):
                 pass
+
             tg_pairs = _parse_telegram_paste("\n".join(collected))
             if tg_pairs:
-                n_added = 0
                 for word, rank in sorted(tg_pairs, key=lambda x: x[1]):
                     if rank == 1:
                         print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
                         solver.reset()
                         cur_word, cur_reason = solver.suggest()
-                        last_display_t = 0.0
                         break
-                    if word in solver.guesses:
-                        continue
-                    if word not in _vocab_set:
+                    if word in solver.guesses or word not in _vocab_set:
                         continue
                     solver.add_guess(word, rank)
-                    n_added += 1
                 else:
-                    if n_added:
-                        cur_word, cur_reason = solver.suggest()
+                    cur_word, cur_reason = solver.suggest()
             continue
 
         raw = raw_lower
 
-        # Telegram заголовки и разделители — тихо пропускать
+        # Telegram заголовки/разделители — пропускать (fallback если всё же просочились)
         if raw_lower.startswith("топ ближайших") or re.match(r'^-{3,}$', raw_lower):
             continue
 
-        # Telegram emoji-строка: "🔴 слово (10145)"
+        # Telegram emoji-строка (fallback)
         tg_m = re.match(r'^[^а-яёa-z\d]*([а-яё]{2,})\s*\((\d+)\)', raw_lower)
         if tg_m:
             word, rank = tg_m.group(1), int(tg_m.group(2))
@@ -514,7 +510,6 @@ def run():
                 print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
                 solver.reset()
                 cur_word, cur_reason = solver.suggest()
-                last_display_t = 0.0
             elif word not in solver.guesses and word in _vocab_set:
                 solver.add_guess(word, rank)
                 cur_word, cur_reason = solver.suggest()
@@ -529,7 +524,6 @@ def run():
 
         done = False
         for word, rank in pairs:
-            # Пропуск слова ('слово ?')
             if rank is None:
                 print(f"  {DIM}'{word}' нет в игре — пропускаем{RESET}")
                 solver.guesses[word] = -1
@@ -537,7 +531,6 @@ def run():
                     solver.candidates.discard(word)
                 continue
 
-            # Нашли загаданное слово
             if rank == 1:
                 print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
                 solver.reset()
@@ -545,11 +538,9 @@ def run():
                 done = True
                 break
 
-            # Слова нет в нашем словаре — опечатка или отсутствует
             if word not in _vocab_set:
                 print(f"  {RED}'{word}' нет в нашем словаре — проверь написание{RESET}")
                 print(f"  {DIM}Триангуляция пропущена. Если слова нет в игре — используй '{word} ?'{RESET}")
-                # Не трогаем кандидатов, слово не добавляем в историю
                 continue
 
             solver.add_guess(word, rank)
