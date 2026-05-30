@@ -448,15 +448,22 @@ def run():
             print(f"{DIM}Новая игра.{RESET}\n")
             continue
 
-        # Telegram paste: собираем остальные строки до пустой
+        # Telegram paste: собираем строки до двух пустых подряд
+        # (одиночные пустые — разделители внутри сообщения)
         if _looks_like_telegram_start(raw):
             collected = [raw]
+            consecutive_empty = 0
             try:
                 while True:
                     nxt = input("").strip()
                     if not nxt:
-                        break
-                    collected.append(nxt)
+                        consecutive_empty += 1
+                        if consecutive_empty >= 2:
+                            break
+                        collected.append("")
+                    else:
+                        consecutive_empty = 0
+                        collected.append(nxt)
                     if len(collected) > 300:
                         break
             except (EOFError, KeyboardInterrupt):
