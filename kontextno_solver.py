@@ -10,9 +10,7 @@ import sys
 sys.stdout.reconfigure(line_buffering=True)
 
 import json
-import os
 import re
-import select
 import numpy as np
 from pathlib import Path
 
@@ -332,66 +330,10 @@ def _parse_pairs(parts: list[str], cur_word: str) -> list[tuple[str, int | None]
     return pairs or None
 
 
-def _looks_like_telegram_start(line: str) -> bool:
-    low = line.lower()
-    return low.startswith("слово:") or low.startswith("близость:")
-
-
-def _parse_telegram_paste(text: str) -> list[tuple[str, int]] | None:
-    """
-    Разбирает вставленное Telegram-сообщение из игры.
-
-    Формат блока:
-        Слово: стакан 🟡
-        Близость: 322
-
-        Топ ближайших слов:
-        🟡 стакан (322)
-        🔴 море (6208)
-        ----------------
-
-    Извлекает все пары (слово, ранг) из Слово/Близость строк
-    и из emoji-строк. При дублях берёт минимальный ранг.
-    """
-    low = text.lower()
-    if "близость:" not in low and "слово:" not in low:
-        return None
-
-    pairs: dict[str, int] = {}
-    pending_word: str | None = None
-
-    for line in text.splitlines():
-        s = line.strip()
-        sl = s.lower()
-
-        # "Слово: стакан 🟡" → pending_word
-        m = re.match(r'слово:\s*([а-яёa-z]+)', sl)
-        if m:
-            pending_word = m.group(1)
-            continue
-
-        # "Близость: 322" → closes the pair
-        m = re.match(r'близость:\s*(\d+)', sl)
-        if m and pending_word:
-            rank = int(m.group(1))
-            if pending_word not in pairs or rank < pairs[pending_word]:
-                pairs[pending_word] = rank
-            pending_word = None
-            continue
-
-        # Сброс pending если пришла нерелевантная строка
-        if pending_word and sl and not sl.startswith("топ") and "--" not in sl:
-            pending_word = None
-
-        # "🟢/🟡/🟠/🔴 ананас (148)"
-        m = re.search(r'[🟢🟡🟠🔴]\s*([а-яё]+)\s*\((\d+)\)', sl)
-        if m:
-            word = m.group(1)
-            rank = int(m.group(2))
-            if word not in pairs or rank < pairs[word]:
-                pairs[word] = rank
-
-    return list(pairs.items()) if pairs else None
+# Паттерны для строк Telegram-формата
+_TG_SLOVO   = re.compile(r'слово:\s*([а-яё]+)')          # "Слово: стакан 🟡"
+_TG_BLIZOST = re.compile(r'близость:\s*(\d+)')            # "Близость: 322"
+_TG_EMOJI   = re.compile(r'^[^а-яёa-z\d]*([а-яё]{2,})\s*\((\d+)\)')  # "🔴 слово (10145)"
 
 
 def run():
@@ -408,6 +350,7 @@ def run():
     print(f"{DIM}  n — новая игра  |  q — выход{RESET}\n")
 
     cur_word, cur_reason = solver.suggest()
+    pending_tg_word: str | None = None  # ждём "Близость:" после "Слово:"
 
     while True:
         # Единственный кандидат — это и есть ответ
@@ -417,25 +360,22 @@ def run():
             solver.reset()
             cur_word, cur_reason = solver.suggest()
 
-        # История угаданных
-        if solver.guesses:
-            print()
-            for w, r in sorted(solver.guesses.items(), key=lambda x: x[1] if x[1] > 0 else 99999):
-                if r < 0: continue
-                col = rank_color(r)
-                print(f"  {col}{r:>5}{RESET}  {w}")
-            print()
-
-        # Кандидаты если их мало
-        if solver.candidates and len(solver.candidates) <= 5:
-            print(f"  {YELLOW}Кандидаты:{RESET}")
-            _print_candidates(solver)
-            print()
-
-        # Предложение
-        info = solver.info()
-        info_str = f"  {DIM}[{info}]{RESET}" if info else ""
-        print(f"  {BOLD}{YELLOW}→ {cur_word.upper()}{RESET}  {DIM}({cur_reason}){RESET}{info_str}")
+        # Показываем состояние только когда не в середине Telegram-пары
+        if not pending_tg_word:
+            if solver.guesses:
+                print()
+                for w, r in sorted(solver.guesses.items(), key=lambda x: x[1] if x[1] > 0 else 99999):
+                    if r < 0: continue
+                    col = rank_color(r)
+                    print(f"  {col}{r:>5}{RESET}  {w}")
+                print()
+            if solver.candidates and len(solver.candidates) <= 5:
+                print(f"  {YELLOW}Кандидаты:{RESET}")
+                _print_candidates(solver)
+                print()
+            info = solver.info()
+            info_str = f"  {DIM}[{info}]{RESET}" if info else ""
+            print(f"  {BOLD}{YELLOW}→ {cur_word.upper()}{RESET}  {DIM}({cur_reason}){RESET}{info_str}")
 
         try:
             raw = input("  ").strip()
@@ -443,9 +383,11 @@ def run():
             print("\nВыход."); return
 
         if not raw:
+            pending_tg_word = None
             continue
 
         raw_lower = raw.lower()
+
         if raw_lower in ("q", "quit", "выход"):
             print("Выход."); return
         if raw_lower == "?":
@@ -454,54 +396,21 @@ def run():
         if raw_lower in ("n", "new", "новая"):
             solver.reset()
             cur_word, cur_reason = solver.suggest()
+            pending_tg_word = None
             print(f"{DIM}Новая игра.{RESET}\n")
             continue
 
-        # Telegram paste.
-        # Первая строка уже получена через input(). Остаток paste лежит
-        # в буфере TTY нетронутым — читаем его через os.read() с нулевым
-        # select (неблокирующая проверка, никаких задержек).
-        # Readline не затрагивается: он не буферизует данные заранее.
-        if _looks_like_telegram_start(raw):
-            extra = b""
-            try:
-                while True:
-                    ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0)
-                    if not ready:
-                        break
-                    chunk = os.read(sys.stdin.fileno(), 4096)
-                    if not chunk:
-                        break
-                    extra += chunk
-            except OSError:
-                pass
-
-            full_text = raw + "\n" + extra.decode("utf-8", errors="replace")
-            tg_pairs = _parse_telegram_paste(full_text)
-            if tg_pairs:
-                for word, rank in sorted(tg_pairs, key=lambda x: x[1]):
-                    if rank == 1:
-                        print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
-                        solver.reset()
-                        cur_word, cur_reason = solver.suggest()
-                        break
-                    if word in solver.guesses or word not in _vocab_set:
-                        continue
-                    solver.add_guess(word, rank)
-                else:
-                    cur_word, cur_reason = solver.suggest()
+        # "Слово: стакан 🟡" → запомнить слово, ждать Близость
+        m = _TG_SLOVO.match(raw_lower)
+        if m:
+            pending_tg_word = m.group(1)
             continue
 
-        raw = raw_lower
-
-        # Telegram заголовки/разделители — пропускать (fallback если всё же просочились)
-        if raw_lower.startswith("топ ближайших") or re.match(r'^-{3,}$', raw_lower):
-            continue
-
-        # Telegram emoji-строка (fallback)
-        tg_m = re.match(r'^[^а-яёa-z\d]*([а-яё]{2,})\s*\((\d+)\)', raw_lower)
-        if tg_m:
-            word, rank = tg_m.group(1), int(tg_m.group(2))
+        # "Близость: 322" → завершить пару
+        m = _TG_BLIZOST.match(raw_lower)
+        if m and pending_tg_word:
+            word, rank = pending_tg_word, int(m.group(1))
+            pending_tg_word = None
             if rank == 1:
                 print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
                 solver.reset()
@@ -511,7 +420,27 @@ def run():
                 cur_word, cur_reason = solver.suggest()
             continue
 
-        parts = raw.split()
+        pending_tg_word = None
+
+        # "Топ ближайших слов:" / "--------" → пропустить
+        if raw_lower.startswith("топ ближайших") or re.match(r'^-{3,}$', raw_lower):
+            continue
+
+        # "🔴 слово (10145)" → прямая пара
+        m = _TG_EMOJI.match(raw_lower)
+        if m:
+            word, rank = m.group(1), int(m.group(2))
+            if rank == 1:
+                print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {word.upper()}{RESET}\n")
+                solver.reset()
+                cur_word, cur_reason = solver.suggest()
+            elif word not in solver.guesses and word in _vocab_set:
+                solver.add_guess(word, rank)
+                cur_word, cur_reason = solver.suggest()
+            continue
+
+        # Обычный ввод
+        parts = raw_lower.split()
         pairs = _parse_pairs(parts, cur_word)
 
         if pairs is None:
