@@ -408,6 +408,14 @@ def run():
     cur_word, cur_reason = solver.suggest()
 
     while True:
+        # Если остался единственный кандидат — это и есть ответ
+        if solver.candidates and len(solver.candidates) == 1:
+            secret = list(solver.candidates)[0]
+            print(f"\n  {BOLD}{GREEN}ЗАГАДАНО: {secret.upper()}{RESET}\n")
+            solver.reset()
+            cur_word, cur_reason = solver.suggest()
+            continue
+
         # История угаданных
         if solver.guesses:
             print()
